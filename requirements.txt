@@ -1,0 +1,6 @@
+openai>=1.40.0
+pydantic>=2.7
+numpy>=1.26
+python-dotenv>=1.0
+rich>=13.7
+pytest>=8.0
