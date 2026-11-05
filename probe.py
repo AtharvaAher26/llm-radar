@@ -91,17 +91,23 @@ def output_hash(text: str) -> str:
     return hashlib.sha256(normalize_output(text).encode("utf-8")).hexdigest()[:16]
 
 
-def probe_model(provider: dict, model: str) -> dict:
-    """One probe = one deterministic prompt -> record. No failover, ever."""
-    base = {
-        "provider": provider["provider"], "model": model,
-        "probed_at": utc_now(), "prompt": PROBE_PROMPT,
-    }
+def call_model(provider: dict, model: str, prompt: str,
+               max_tokens: int = 512) -> dict:
+    """The single call path: one deterministic (temperature 0) completion.
+
+    Shared by probe_model() and the canary runner, so both measure models
+    the exact same way. No failover, ever — failures are classified and
+    returned as data. Returns a dict:
+      status:     alive | down | skipped (skipped = no API key configured)
+      output:     full response text (None unless alive)
+      error_type: classify_error() class (None when alive)
+      latency_ms: last attempt's latency
+      attempts:   attempts made (0 when skipped)
+    """
     key = os.getenv(provider["key_var"])
     if not key:
-        return {**base, "status": "skipped", "error_type": "no_key",
-                "latency_ms": None, "output_preview": None,
-                "output_hash": None, "attempts": 0}
+        return {"status": "skipped", "error_type": "no_key", "output": None,
+                "latency_ms": None, "attempts": 0}
 
     client = OpenAI(api_key=key, base_url=provider["base_url"], timeout=30)
 
@@ -111,14 +117,13 @@ def probe_model(provider: dict, model: str) -> dict:
         try:
             resp = client.chat.completions.create(
                 model=model,
-                messages=[{"role": "user", "content": PROBE_PROMPT}],
-                temperature=0.0, max_tokens=20,
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.0, max_tokens=max_tokens,
             )
             latency_ms = int((time.perf_counter() - t0) * 1000)
             out = resp.choices[0].message.content or ""
-            return {**base, "status": "alive", "error_type": None,
-                    "latency_ms": latency_ms, "output_preview": out[:80],
-                    "output_hash": output_hash(out), "attempts": attempt}
+            return {"status": "alive", "error_type": None, "output": out,
+                    "latency_ms": latency_ms, "attempts": attempt}
         except Exception as e:
             last_err, last_class = e, classify_error(e)
             if last_class in RETRY_CLASSES and attempt < MAX_ATTEMPTS:
@@ -129,9 +134,30 @@ def probe_model(provider: dict, model: str) -> dict:
                 break
 
     latency_ms = int((time.perf_counter() - t0) * 1000)
-    return {**base, "status": "down", "error_type": last_class,
-            "error_detail": str(last_err)[:150], "latency_ms": latency_ms,
-            "output_preview": None, "output_hash": None, "attempts": attempt}
+    return {"status": "down", "error_type": last_class,
+            "error_detail": str(last_err)[:150], "output": None,
+            "latency_ms": latency_ms, "attempts": attempt}
+
+
+def probe_model(provider: dict, model: str) -> dict:
+    """One probe = one deterministic prompt -> record. No failover, ever."""
+    base = {
+        "provider": provider["provider"], "model": model,
+        "probed_at": utc_now(), "prompt": PROBE_PROMPT,
+    }
+    r = call_model(provider, model, PROBE_PROMPT, max_tokens=20)
+    if r["status"] == "skipped":
+        return {**base, "status": "skipped", "error_type": "no_key",
+                "latency_ms": None, "output_preview": None,
+                "output_hash": None, "attempts": 0}
+    if r["status"] == "alive":
+        out = r["output"] or ""
+        return {**base, "status": "alive", "error_type": None,
+                "latency_ms": r["latency_ms"], "output_preview": out[:80],
+                "output_hash": output_hash(out), "attempts": r["attempts"]}
+    return {**base, "status": "down", "error_type": r["error_type"],
+            "error_detail": r.get("error_detail", ""), "latency_ms": r["latency_ms"],
+            "output_preview": None, "output_hash": None, "attempts": r["attempts"]}
 
 
 def main() -> None:

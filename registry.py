@@ -5,7 +5,7 @@ and behavior fingerprints. Ingests Phase 0's data/probe.json as its seed.
 import json
 from pathlib import Path
 
-from models import utc_now
+from models import RunResult, utc_now
 
 REGISTRY_PATH = Path("data/registry.json")
 PROBE_SEED = Path("data/probe.json")
@@ -41,12 +41,16 @@ class ModelRegistry:
                 "provider": rec["provider"], "model": rec["model"],
                 "first_seen": None, "last_seen": None,
                 "status": "unknown", "last_error_type": None,
-                "observations": 0,
+                "observations": 0, "fingerprints": {},
             })
             if rec["status"] == "alive":
                 entry["status"] = "active"
                 entry["last_seen"] = rec["probed_at"]
                 entry["first_seen"] = entry["first_seen"] or rec["probed_at"]
+                if rec.get("output_hash"):
+                    # the probe prompt is fixed, so its hash IS comparable
+                    # across runs — store it instead of discarding it.
+                    self._set_fingerprint(entry, "probe", rec["output_hash"])
             elif rec["status"] == "down":
                 # timeouts are NOT retirements — only 404/410 retires a model
                 if rec.get("error_type") == "retired_or_unavailable":
@@ -59,6 +63,55 @@ class ModelRegistry:
         self._save()
         return n
 
+    # -------- behavior fingerprints (output hashes, compared over time) --------
+
+    @staticmethod
+    def _set_fingerprint(entry: dict, source: str, new_hash: str) -> bool:
+        """Store the latest hash for a source. Returns True if it CHANGED
+        (a previous hash existed and differs) — first sighting is not drift."""
+        fps = entry.setdefault("fingerprints", {})
+        old = fps.get(source, {}).get("hash")
+        fps[source] = {"hash": new_hash, "updated_at": utc_now()}
+        return old is not None and old != new_hash
+
+    def record_fingerprints(self, provider: str, model: str,
+                            hashes: dict[str, str | None]) -> list[str]:
+        """Store latest output hashes {source: hash}; return the sources
+        whose fingerprint changed vs the previously stored one."""
+        k = self.key(provider, model)
+        entry = self.models.setdefault(k, {
+            "provider": provider, "model": model,
+            "first_seen": None, "last_seen": None,
+            "status": "unknown", "last_error_type": None,
+            "observations": 0, "fingerprints": {},
+        })
+        changed = [src for src, h in hashes.items()
+                   if h and self._set_fingerprint(entry, src, h)]
+        self._save()
+        return changed
+
+    def fingerprint(self, provider: str, model: str, source: str) -> str | None:
+        entry = self.models.get(self.key(provider, model), {})
+        return entry.get("fingerprints", {}).get(source, {}).get("hash")
+
+    def record_run(self, provider: str, model: str,
+                   results: list[RunResult]) -> list[str]:
+        """Ingest one full canary run: roll the model's status up from the
+        results and store every output hash as a fingerprint.
+        Returns the canary ids whose fingerprint changed since last run."""
+        alive = any(r.status == "alive" for r in results)
+        errors = [r.error_type for r in results if r.error_type]
+        if alive:
+            self.record_result(provider, model, "alive")
+        elif results and all(r.status == "skipped" for r in results):
+            pass    # never measured (no API key) — not a status change
+        elif "retired_or_unavailable" in errors:
+            self.record_result(provider, model, "down", "retired_or_unavailable")
+        elif results:
+            self.record_result(provider, model, "down", errors[0] if errors else None)
+        return self.record_fingerprints(
+            provider, model, {r.canary_id: r.output_hash for r in results})
+
     def record_result(self, provider: str, model: str, status: str,
                       error_type: str | None = None) -> None:
         k = self.key(provider, model)
@@ -66,6 +119,7 @@ class ModelRegistry:
             "provider": provider, "model": model,
             "first_seen": None, "last_seen": None,
             "status": "unknown", "last_error_type": None, "observations": 0,
+            "fingerprints": {},
         })
         if status == "alive":
             entry["status"] = "active"
