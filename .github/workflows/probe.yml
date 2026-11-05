@@ -1,0 +1,46 @@
+name: llm-radar probe
+
+# The "continuously" in continuously probes: run the probe + the full
+# canary suite daily, and keep the results as a build artifact.
+# API keys come from repository secrets; without them every model is
+# recorded as skipped/no_key and the run still succeeds — the radar
+# degrades gracefully instead of failing red.
+
+on:
+  schedule:
+    - cron: "17 6 * * *"   # daily, 06:17 UTC
+  workflow_dispatch:
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Probe candidate models (Phase 0)
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          NVIDIA_API_KEY: ${{ secrets.NVIDIA_API_KEY }}
+        run: python probe.py
+
+      - name: Run canary suite + drift comparison (Phase 2)
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          NVIDIA_API_KEY: ${{ secrets.NVIDIA_API_KEY }}
+        run: python canary_runner.py
+
+      - name: Upload radar data (probe seed, registry, runs, alerts)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: llm-radar-data
+          path: data/
+          if-no-files-found: ignore
+          retention-days: 30
