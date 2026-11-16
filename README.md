@@ -56,6 +56,17 @@ API keys (either or both; missing keys only skip that provider's models) — put
 - `GEMINI_API_KEY` — Google AI Studio key, for the Gemini candidates
 - `NVIDIA_API_KEY` — NVIDIA NIM key, for the NIM candidates
 
+### Repository secrets (daily probe)
+
+The scheduled GitHub Actions probe (`.github/workflows/probe.yml`) reads the
+same keys from repository secrets — **Settings → Secrets and variables →
+Actions → New repository secret**, one secret per key name above. Until a
+key is added there, that provider's models are recorded as `skipped` /
+`no_key` and the workflow still succeeds, so a green daily run with
+everything skipped means "no keys configured", not "all models healthy".
+Never commit a key: local runs use a `.env` file (gitignored), never a
+checked-in file.
+
 ```bash
 python probe.py                       # Phase 0: probe + registry seed
 python demo_phase1.py                 # Phase 1: suite + registry overview
